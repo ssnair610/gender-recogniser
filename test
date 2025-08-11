@@ -1,0 +1,259 @@
+python - <<'PY'
+# Generates Gender_Recognition_PyTorch_Plotly.ipynb for:
+# archive/Train/{Female,Male}, archive/Test/{Female,Male}, archive/Validation/*(no class folders)
+import nbformat as nbf
+from nbformat.v4 import new_notebook, new_markdown_cell, new_code_cell
+from pathlib import Path
+nb=new_notebook(cells=[]); md=lambda s: nb.cells.append(new_markdown_cell(s)); code=lambda s: nb.cells.append(new_code_cell(s))
+
+md("# Gender Recognition — PyTorch + Plotly\n"
+   "\n**Setup (important):**\n```\narchive/\n  Train/{Female,Male}\n  Test/{Female,Male}\n  Validation/*  # unlabeled, final test only\n```\n\n"
+   "This notebook:\n- Builds a **stratified** train/val split from `Train/` (for early stopping & tuning)\n- Trains ResNet‑18 (transfer learning) with class‑imbalance handling\n- Evaluates on **`Test/`** (labeled)\n- Runs **final inference** on **`Validation/`** (unlabeled) and writes `outputs/validation_predictions.csv`\n- Uses **Plotly** for curves & confusion matrix"
+)
+
+code("""# If missing, install packages in the notebook cell:
+# %pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cpu
+# %pip install plotly scikit-learn pandas pillow
+""")
+
+code("""import os, json, time
+from pathlib import Path
+import numpy as np
+import pandas as pd
+import torch, torch.nn as nn
+from torch.utils.data import DataLoader, WeightedRandomSampler, Subset
+from torchvision import datasets, transforms, models
+from PIL import Image
+import plotly.graph_objects as go
+
+from sklearn.metrics import classification_report, confusion_matrix
+from sklearn.model_selection import StratifiedShuffleSplit
+
+SEED=42
+torch.manual_seed(SEED); np.random.seed(SEED)
+device=torch.device('cuda' if torch.cuda.is_available() else 'cpu'); device
+""")
+
+code("""# Paths & config
+DATA_DIR = Path('archive')
+TRAIN_DIR = DATA_DIR/'Train'
+TEST_DIR  = DATA_DIR/'Test'
+VALI_DIR  = DATA_DIR/'Validation'  # unlabeled, used only for final predictions
+
+IMG_SIZE=224
+BATCH_SIZE=32
+LR=3e-4
+WEIGHT_DECAY=1e-4
+EPOCHS=20
+PATIENCE=5
+VAL_SPLIT=0.1  # create our own validation from Train
+
+OUT_DIR = Path('outputs'); OUT_DIR.mkdir(parents=True, exist_ok=True)
+
+assert TRAIN_DIR.exists() and TEST_DIR.exists(), 'Train/Test folders not found.'
+assert VALI_DIR.exists(), 'Validation folder not found (for final inference).'
+print('Using data at', DATA_DIR.resolve())
+""")
+
+code("""# Transforms & datasets
+IMAGENET_MEAN=[0.485,0.456,0.406]; IMAGENET_STD=[0.229,0.224,0.225]
+train_tfms = transforms.Compose([
+    transforms.Resize((256,256)),
+    transforms.RandomResizedCrop(IMG_SIZE, scale=(0.85,1.0)),
+    transforms.RandomHorizontalFlip(),
+    transforms.ColorJitter(brightness=0.1, contrast=0.1),
+    transforms.ToTensor(),
+    transforms.Normalize(IMAGENET_MEAN, IMAGENET_STD),
+])
+eval_tfms = transforms.Compose([
+    transforms.Resize((256,256)),
+    transforms.CenterCrop(IMG_SIZE),
+    transforms.ToTensor(),
+    transforms.Normalize(IMAGENET_MEAN, IMAGENET_STD),
+])
+
+ds_train_full = datasets.ImageFolder(TRAIN_DIR, transform=train_tfms)
+class_names = ds_train_full.classes
+num_classes = len(class_names)
+print('Classes:', class_names)
+
+# Stratified split indices for train/val
+y_full = np.array([y for _,y in ds_train_full.samples])
+sss = StratifiedShuffleSplit(n_splits=1, test_size=VAL_SPLIT, random_state=SEED)
+train_idx, val_idx = next(sss.split(np.zeros(len(y_full)), y_full))
+
+ds_train = Subset(datasets.ImageFolder(TRAIN_DIR, transform=train_tfms), train_idx)
+ds_val   = Subset(datasets.ImageFolder(TRAIN_DIR, transform=eval_tfms),   val_idx)
+ds_test  = datasets.ImageFolder(TEST_DIR, transform=eval_tfms)
+
+print(f'Train: {len(ds_train)} | Val: {len(ds_val)} | Test: {len(ds_test)}')
+""")
+
+code("""# Class weights from the full train set distribution (before split)
+targets_full = y_full
+class_counts = np.bincount(targets_full, minlength=num_classes)
+class_weights = 1.0 / np.maximum(class_counts,1)
+
+# Per-sample weights for the *train subset* only
+train_targets = y_full[train_idx]
+sample_weights = [class_weights[y] for y in train_targets]
+sampler = WeightedRandomSampler(weights=torch.DoubleTensor(sample_weights),
+                                num_samples=len(sample_weights), replacement=True)
+
+dl_train = DataLoader(ds_train, batch_size=BATCH_SIZE, sampler=sampler, num_workers=2, pin_memory=True)
+dl_val   = DataLoader(ds_val,   batch_size=BATCH_SIZE, shuffle=False, num_workers=2, pin_memory=True)
+dl_test  = DataLoader(ds_test,  batch_size=BATCH_SIZE, shuffle=False, num_workers=2, pin_memory=True)
+
+print('Train class counts (full):', dict(zip(class_names, class_counts)))
+""")
+
+code("""# Model + loss/optim/scheduler
+try:
+    weights = models.ResNet18_Weights.DEFAULT
+    model = models.resnet18(weights=weights)
+except Exception:
+    model = models.resnet18(pretrained=True)
+
+in_features = model.fc.in_features
+model.fc = nn.Linear(in_features, num_classes)
+model = model.to(device)
+
+cw = torch.tensor(class_weights / class_weights.sum() * num_classes, dtype=torch.float32).to(device)
+criterion = nn.CrossEntropyLoss(weight=cw)
+optimizer = torch.optim.AdamW(model.parameters(), lr=LR, weight_decay=WEIGHT_DECAY)
+scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='min', factor=0.5, patience=2, verbose=True)
+""")
+
+code("""def epoch_step(loader, train: bool):
+    model.train() if train else model.eval()
+    running_loss, running_corrects, total = 0.0, 0, 0
+    all_preds, all_targets = [], []
+    for xb, yb in loader:
+        xb, yb = xb.to(device), yb.to(device)
+        with torch.set_grad_enabled(train):
+            logits = model(xb)
+            loss = criterion(logits, yb)
+            if train:
+                optimizer.zero_grad(); loss.backward(); optimizer.step()
+        preds = logits.argmax(1)
+        running_loss += loss.item() * xb.size(0)
+        running_corrects += (preds == yb).sum().item()
+        total += xb.size(0)
+        all_preds.append(preds.detach().cpu()); all_targets.append(yb.detach().cpu())
+    avg_loss = running_loss / max(total, 1)
+    avg_acc  = running_corrects / max(total, 1)
+    return avg_loss, avg_acc, torch.cat(all_preds).numpy(), torch.cat(all_targets).numpy()
+
+def train_model(epochs=EPOCHS, patience=PATIENCE):
+    best_val, best_state, patience_left = float('inf'), None, patience
+    hist={'train_loss':[],'val_loss':[],'train_acc':[],'val_acc':[]}
+    for e in range(1, epochs+1):
+        tr_loss, tr_acc, _, _ = epoch_step(dl_train, True)
+        val_loss, val_acc, _, _ = epoch_step(dl_val, False)
+        scheduler.step(val_loss)
+        hist['train_loss'].append(tr_loss); hist['val_loss'].append(val_loss)
+        hist['train_acc'].append(tr_acc);   hist['val_acc'].append(val_acc)
+        print(f'Epoch {e:02d}/{epochs} | train_loss {tr_loss:.4f} val_loss {val_loss:.4f} | train_acc {tr_acc:.3f} val_acc {val_acc:.3f}')
+        if val_loss < best_val - 1e-4:
+            best_val, best_state, patience_left = val_loss, {k:v.cpu() for k,v in model.state_dict().items()}, patience
+            torch.save(best_state, OUT_DIR/'best_model.pt')
+            with open(OUT_DIR/'labels.json','w') as f: json.dump({i:n for i,n in enumerate(class_names)}, f)
+            print('  ✓ Saved new best model.')
+        else:
+            patience_left -= 1
+            if patience_left <= 0:
+                print('  Early stopping.'); break
+    if best_state is not None:
+        model.load_state_dict(best_state); model.to(device)
+    return hist
+
+history = train_model()
+""")
+
+code("""# Plotly curves
+x=list(range(1,len(history['train_loss'])+1))
+fig1=go.Figure(); fig1.add_scatter(x=x,y=history['train_loss'],mode='lines+markers',name='train_loss')
+fig1.add_scatter(x=x,y=history['val_loss'],mode='lines+markers',name='val_loss')
+fig1.update_layout(title='Loss',xaxis_title='Epoch',yaxis_title='Loss'); fig1.show()
+
+fig2=go.Figure(); fig2.add_scatter(x=x,y=history['train_acc'],mode='lines+markers',name='train_acc')
+fig2.add_scatter(x=x,y=history['val_acc'],mode='lines+markers',name='val_acc')
+fig2.update_layout(title='Accuracy',xaxis_title='Epoch',yaxis_title='Accuracy'); fig2.show()
+""")
+
+code("""# Test set evaluation + confusion matrix (Plotly)
+test_loss, test_acc, test_preds, test_targets = epoch_step(dl_test, False)
+print(f'Test — loss: {test_loss:.4f} | acc: {test_acc:.3f}')
+print('\\nClassification Report (Test):')
+print(classification_report(test_targets, test_preds, target_names=class_names))
+
+cm = confusion_matrix(test_targets, test_preds, labels=list(range(len(class_names))))
+fig = go.Figure(data=go.Heatmap(z=cm, x=class_names, y=class_names, colorscale='Viridis',
+                                hovertemplate='Predicted: %{x}<br>Actual: %{y}<br>Count: %{z}<extra></extra>'))
+fig.update_layout(title='Confusion Matrix (Test)', xaxis_title='Predicted', yaxis_title='Actual')
+fig.show()
+""")
+
+code("""# Final inference on unlabeled Validation/ -> CSV
+def gather_images(root: Path):
+    # all files recursively under Validation/
+    exts={'.jpg','.jpeg','.png','.bmp','.webp','.tif','.tiff'}
+    return [p for p in root.rglob('*') if p.suffix.lower() in exts]
+
+from torchvision.transforms.functional import to_tensor, normalize, resize, center_crop
+def preprocess_pil(img):
+    # mirror eval_tfms
+    img = img.convert('RGB')
+    img = img.resize((256,256))
+    img = center_crop(to_tensor(img), [IMG_SIZE, IMG_SIZE])  # center crop after resize
+    # Need Normalize on CHW tensor
+    mean=torch.tensor([0.485,0.456,0.406])[:,None,None]
+    std =torch.tensor([0.229,0.224,0.225])[:,None,None]
+    return normalize(img, mean, std)
+
+img_paths = gather_images(VALI_DIR)
+print('Validation images (unlabeled):', len(img_paths))
+
+def predict_image(path: Path):
+    from PIL import Image as PILImage
+    model.eval()
+    with torch.no_grad():
+        img = PILImage.open(path).convert('RGB')
+        x = transforms.Compose([
+            transforms.Resize((256,256)),
+            transforms.CenterCrop(IMG_SIZE),
+            transforms.ToTensor(),
+            transforms.Normalize(IMAGENET_MEAN, IMAGENET_STD),
+        ])(img).unsqueeze(0).to(device)
+        probs = torch.softmax(model(x), dim=1).cpu().numpy()[0]
+    pred_idx=int(np.argmax(probs))
+    return class_names[pred_idx], probs
+
+rows=[]
+for p in img_paths:
+    label, probs = predict_image(p)
+    row = {'filepath': str(p)}
+    row['pred_class']=label
+    for i,cn in enumerate(class_names):
+        row[f'prob_{cn}']=float(probs[i])
+    rows.append(row)
+
+df=pd.DataFrame(rows).sort_values('filepath')
+csv_path=OUT_DIR/'validation_predictions.csv'
+df.to_csv(csv_path, index=False)
+print('Wrote', csv_path.resolve())
+df.head()
+""")
+
+code("""print('Best model:', (OUT_DIR/'best_model.pt').resolve())
+print('Labels:', (OUT_DIR/'labels.json').resolve())
+print('Validation predictions CSV:', (OUT_DIR/'validation_predictions.csv').resolve())
+
+import torchvision as tv, torch as th
+print('Torch:', th.__version__); print('Torchvision:', tv.__version__)
+""")
+
+out = Path('Gender_Recognition_PyTorch_Plotly.ipynb')
+with open(out,'w',encoding='utf-8') as f: nbf.write(nb,f)
+print('Wrote', out.resolve())
+PY
